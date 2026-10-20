@@ -1,0 +1,1 @@
+{"entries":[{"added":"2026-10-20","id":"empty-infinite-loop","kind":"regex","pattern":"while\\s+true\\s+do\\s*end","reason":"Empty infinite loop with no yield and no exit condition freezes the client. Seed entry shipped with the Phase 1B pre-flight gate."}],"last_modified":"2026-10-20","version":1}
