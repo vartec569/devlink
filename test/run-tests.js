@@ -178,6 +178,29 @@ function wsHello(version, nonce) {
   const benignRes = await benignPromise;
   check("benign test_hang resolves ok", benignRes.json.ok === true, benignRes.json);
 
+  // --- 1C: generic op endpoint + execute passes the SAME pre-flight gate (P4) ---
+  const execPromise = api("/api/op/execute", { method: "POST", body: { code: "return 67" } }, token);
+  const execOp = await new Promise((resolve) => {
+    const iv = setInterval(() => {
+      const found = opsSeen.find((m) => m.op === "execute" && m.payload && m.payload.code === "return 67");
+      if (found) { clearInterval(iv); resolve(found); }
+    }, 50);
+    setTimeout(() => { clearInterval(iv); resolve(null); }, 4000);
+  });
+  check("generic endpoint routed execute to the bridge", !!execOp, opsSeen.map((m) => m.op));
+  if (execOp) {
+    b1.ws.send(JSON.stringify({ type: "op_result", request_id: execOp.request_id, nonce: nonce1, ok: true, data: { ok: true, returns: [67], prints: [] } }));
+  }
+  const execRes = await execPromise;
+  check("execute round-trip via generic endpoint", execRes.json.ok === true && execRes.json.data.returns[0] === 67, execRes.json);
+
+  const execBlocked = await api("/api/op/execute", { method: "POST", body: { code: "while true do end" } }, token);
+  check("execute with blacklisted code is blocked by pre-flight (P4)",
+    execBlocked.json.ok === false && execBlocked.json.outcome === "blocked_by_preflight", execBlocked.json);
+  await sleep(400);
+  check("blocked execute never reached the bridge",
+    !opsSeen.some((m) => m.op === "execute" && m.payload && m.payload.code === "while true do end"), opsSeen.length);
+
   // --- unknown_outcome: bridge dies mid-call ---
   const ping2 = api("/api/session/ping", { method: "POST", body: {} }, token);
   await new Promise((resolve) => {
