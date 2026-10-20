@@ -86,6 +86,8 @@ function wsHello(version, nonce) {
   check("status without token is 401", r.status === 401, r);
   r = await api("/api/status", {}, token);
   check("status with token: no session yet", r.status === 200 && r.json.session === null, r.json);
+  check("status surfaces blacklist version + last_modified + entry count",
+    r.json.blacklist && r.json.blacklist.version === 1 && r.json.blacklist.last_modified === "2026-10-20" && r.json.blacklist.entries >= 1, r.json.blacklist);
 
   // --- Bridge: protocol version refusal ---
   const refused = await wsHello("2.0");
@@ -150,6 +152,31 @@ function wsHello(version, nonce) {
   const hangSlow = await hangSlowPromise;
   check("test_hang 8000ms -> timeout outcome at the 5s class budget",
     hangSlow.json.ok === false && hangSlow.json.outcome === "timeout", hangSlow.json);
+
+  // --- Pre-flight blacklist (1B): blocked payload never reaches the bridge ---
+  const opsSeen = [];
+  b1.ws.on("message", (raw) => { const m = JSON.parse(String(raw)); if (m.type === "op") opsSeen.push(m); });
+  const blockedRes = await api("/api/session/test-hang", { method: "POST", body: { ms: 50, note: "while true do end" } }, token);
+  check("blacklisted payload -> blocked_by_preflight with entry id",
+    blockedRes.json.ok === false && blockedRes.json.outcome === "blocked_by_preflight" && blockedRes.json.entry === "empty-infinite-loop", blockedRes.json);
+  await sleep(600);
+  check("blocked payload NEVER reached the bridge",
+    !opsSeen.some((m) => m.payload && m.payload.note === "while true do end"), opsSeen.map((m) => m.op));
+
+  const benignPromise = api("/api/session/test-hang", { method: "POST", body: { ms: 50, note: "hello world" } }, token);
+  const benignOp = await new Promise((resolve) => {
+    const iv = setInterval(() => {
+      const found = opsSeen.find((m) => m.payload && m.payload.note === "hello world");
+      if (found) { clearInterval(iv); resolve(found); }
+    }, 50);
+    setTimeout(() => { clearInterval(iv); resolve(null); }, 4000);
+  });
+  check("benign payload passes the gate and reaches the bridge", !!benignOp, opsSeen.length);
+  if (benignOp) {
+    b1.ws.send(JSON.stringify({ type: "op_result", request_id: benignOp.request_id, nonce: nonce1, ok: true, data: { slept_ms: 50 } }));
+  }
+  const benignRes = await benignPromise;
+  check("benign test_hang resolves ok", benignRes.json.ok === true, benignRes.json);
 
   // --- unknown_outcome: bridge dies mid-call ---
   const ping2 = api("/api/session/ping", { method: "POST", body: {} }, token);
@@ -228,6 +255,20 @@ function wsHello(version, nonce) {
   }
   await failFastCase(28431, ["28431", "0.0.0.0", "API"], "API port 28431");
   await failFastCase(28432, ["28432", "127.0.0.1", "Bridge"], "bridge port 28432");
+
+  // --- Fail-fast: malformed crash blacklist at startup ---
+  const fs = require("fs");
+  const badPath = path.join(__dirname, "bad-blacklist.json");
+  fs.writeFileSync(badPath, "{ this is not json");
+  const badInst = startServer({ DL_BLACKLIST: badPath });
+  const badExited = await new Promise((resolve) => {
+    const t = setTimeout(() => resolve(false), 6000);
+    badInst.on("exit", (code) => { clearTimeout(t); resolve(code !== 0 && code !== null); });
+  });
+  const badOut = badInst.out + badInst.err;
+  check("malformed crash_blacklist.json at startup is fatal (gate never silently off)", badExited, badOut);
+  check("fatal message names crash_blacklist.json", badOut.includes("crash_blacklist"), badOut);
+  try { fs.unlinkSync(badPath); } catch (_) {}
 
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
