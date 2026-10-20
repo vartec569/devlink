@@ -20,6 +20,7 @@ file at startup is fatal — a broken safety gate never silently turns off.
 ## Run it
 
 1. `start.bat` (installs deps on first run, generates `.dl-secret`).
+   On Android instead, see `TERMUX.md` (server on the phone via Termux).
 2. Load the client bridge from your host environment:
    `loadstring(game:HttpGet("http://127.0.0.1:28432/bridge.lua"))()`
 3. The bridge connects on its own and reconnects after session drops.
