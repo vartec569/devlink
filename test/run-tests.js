@@ -129,6 +129,28 @@ function wsHello(version, nonce) {
   check("real result resolves ping (ok, pong, latency)",
     pingRes.json.ok === true && pingRes.json.data.pong === true && typeof pingRes.json.latency_ms === "number", pingRes.json);
 
+  // --- test_hang: short sleep resolves; long sleep hits the timeout class ---
+  const hangOkPromise = api("/api/session/test-hang", { method: "POST", body: { ms: 300 } }, token);
+  const hangOp = await new Promise((resolve) => {
+    b1.ws.on("message", (raw) => { const m = JSON.parse(String(raw)); if (m.type === "op" && m.op === "test_hang") resolve(m); });
+    setTimeout(() => resolve(null), 4000);
+  });
+  check("bridge received test_hang op", !!hangOp, hangOp);
+  setTimeout(() => {
+    b1.ws.send(JSON.stringify({ type: "op_result", request_id: hangOp.request_id, nonce: nonce1, ok: true, data: { slept_ms: 300 } }));
+  }, 300);
+  const hangOk = await hangOkPromise;
+  check("test_hang 300ms resolves ok", hangOk.json.ok === true && hangOk.json.data.slept_ms === 300, hangOk.json);
+
+  const hangSlowPromise = api("/api/session/test-hang", { method: "POST", body: { ms: 8000 } }, token);
+  await new Promise((resolve) => {
+    b1.ws.on("message", (raw) => { const m = JSON.parse(String(raw)); if (m.type === "op" && m.op === "test_hang") resolve(m); });
+    setTimeout(resolve, 4000);
+  }); // fake bridge deliberately stays silent
+  const hangSlow = await hangSlowPromise;
+  check("test_hang 8000ms -> timeout outcome at the 5s class budget",
+    hangSlow.json.ok === false && hangSlow.json.outcome === "timeout", hangSlow.json);
+
   // --- unknown_outcome: bridge dies mid-call ---
   const ping2 = api("/api/session/ping", { method: "POST", body: {} }, token);
   await new Promise((resolve) => {
