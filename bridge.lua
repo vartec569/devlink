@@ -210,6 +210,244 @@ OPS.client_status = function(_payload)
 	end
 	return out
 end
+
+-- ============ Wave: structure search ============
+local function resolveInstance(path)
+	if type(path) ~= "string" or path == "" or path == "game" then return game end
+	local segments = string.split(path, ".")
+	local node = game
+	local i = 1
+	if segments[1] == "game" then i = 2 end
+	if segments[i] == "LocalPlayer" then
+		node = Players.LocalPlayer
+		i += 1
+	elseif segments[i] == "workspace" then
+		node = workspace
+		i += 1
+	end
+	for j = i, #segments do
+		if not node then return nil end
+		local child = node:FindFirstChild(segments[j])
+		if not child and node == game then
+			local ok, svc = pcall(function() return game:GetService(segments[j]) end)
+			if ok then child = svc end
+		end
+		node = child
+	end
+	return node
+end
+
+-- Iterative DFS; fn(node) returning true stops the walk early.
+local function walkDescendants(root, fn, budget)
+	budget = budget or 200000
+	local stack = { root }
+	local visited = 0
+	while #stack > 0 do
+		local node = table.remove(stack)
+		visited += 1
+		if visited > budget then return visited, true end
+		if fn(node) then return visited, false end
+		local ok, children = pcall(function() return node:GetChildren() end)
+		if ok then
+			for k = #children, 1, -1 do stack[#stack + 1] = children[k] end
+		end
+	end
+	return visited, false
+end
+
+OPS.resolve_path = function(payload)
+	local inst = resolveInstance(payload and payload.path)
+	if not inst then return { found = false } end
+	return { found = true, instance = serialize(inst, 1) }
+end
+
+OPS.get_children = function(payload)
+	local inst = resolveInstance(payload and payload.path)
+	if not inst then error("path not found: " .. tostring(payload and payload.path)) end
+	local out = {}
+	for _, child in ipairs(inst:GetChildren()) do
+		out[#out + 1] = serialize(child, 1)
+		if #out >= 500 then break end
+	end
+	return { count = #out, children = out }
+end
+
+OPS.get_services = function(_payload)
+	local names = { "Workspace", "Players", "ReplicatedStorage", "ReplicatedFirst", "ServerStorage", "ServerScriptService", "StarterGui", "StarterPack", "StarterPlayer", "Lighting", "Teams", "SoundService", "Chat", "LocalizationService", "TweenService", "RunService", "UserInputService", "ContextActionService", "ProximityPromptService", "CollectionService", "HttpService", "TeleportService", "MarketplaceService", "DataStoreService", "MessagingService", "MemoryStoreService", "PathfindingService", "PhysicsService", "TextService", "GuiService", "VirtualInputManager", "LogService", "Debris", "InsertService", "MaterialService", "AvatarEditorService", "PolicyService", "SocialService", "VoiceChatService", "AnalyticsService" }
+	local out = {}
+	for _, name in ipairs(names) do
+		local ok, svc = pcall(function() return game:GetService(name) end)
+		if ok and svc then out[#out + 1] = serialize(svc, 1) end
+	end
+	return { count = #out, services = out }
+end
+
+OPS.find_instances = function(payload)
+	local root = resolveInstance(payload and payload.root) or game
+	local classWanted = payload and payload.class
+	local nameWanted = payload and payload.name
+	local limit = (payload and payload.limit) or 100
+	local results = {}
+	local budgetHit = false
+	local _, truncated = walkDescendants(root, function(node)
+		if classWanted and not node:IsA(classWanted) then return false end
+		if nameWanted and not string.find(string.lower(node.Name), string.lower(nameWanted), 1, true) then return false end
+		results[#results + 1] = serialize(node, 1)
+		return #results >= limit
+	end)
+	budgetHit = truncated
+	return { count = #results, truncated = #results >= limit or budgetHit, results = results }
+end
+
+OPS.walk_tree = function(payload)
+	local root = resolveInstance(payload and payload.root) or game
+	local maxDepth = (payload and payload.max_depth) or 3
+	local maxNodes = (payload and payload.max_nodes) or 500
+	local count = 0
+	local function build(node, depth)
+		count += 1
+		local entry = serialize(node, 1)
+		if depth < maxDepth and count < maxNodes then
+			local kids = {}
+			local ok, children = pcall(function() return node:GetChildren() end)
+			if ok then
+				for _, child in ipairs(children) do
+					if count >= maxNodes then break end
+					kids[#kids + 1] = build(child, depth + 1)
+				end
+			end
+			entry.children = kids
+		end
+		return entry
+	end
+	local tree = build(root, 0)
+	return { nodes = count, tree = tree }
+end
+
+OPS.read_properties = function(payload)
+	local inst = resolveInstance(payload and payload.path)
+	if not inst then error("path not found: " .. tostring(payload and payload.path)) end
+	local out = {}
+	for _, prop in ipairs((payload and payload.props) or {}) do
+		local ok, value = pcall(function() return inst[prop] end)
+		if ok then out[prop] = serialize(value, 2) else out[prop] = { __error = tostring(value) } end
+	end
+	return { properties = out }
+end
+
+OPS.find_by_property = function(payload)
+	local root = resolveInstance(payload and payload.root) or game
+	local prop = payload and payload.prop
+	local equals = payload and payload.equals
+	local classWanted = payload and payload.class
+	local limit = (payload and payload.limit) or 100
+	if not prop then error("find_by_property requires payload.prop") end
+	local results = {}
+	walkDescendants(root, function(node)
+		if classWanted and not node:IsA(classWanted) then return false end
+		local ok, value = pcall(function() return node[prop] end)
+		if not ok then return false end
+		local match
+		if type(equals) == "number" and type(value) == "number" then match = value == equals
+		else match = tostring(value) == tostring(equals) end
+		if match then
+			results[#results + 1] = serialize(node, 1)
+			return #results >= limit
+		end
+		return false
+	end)
+	return { count = #results, results = results }
+end
+
+OPS.find_by_tag = function(payload)
+	local tag = payload and payload.tag
+	if not tag then error("find_by_tag requires payload.tag") end
+	local cs = game:GetService("CollectionService")
+	local out = {}
+	for _, inst in ipairs(cs:GetTagged(tag)) do
+		out[#out + 1] = serialize(inst, 1)
+		if #out >= ((payload and payload.limit) or 100) then break end
+	end
+	return { count = #out, results = out }
+end
+
+OPS.find_by_attribute = function(payload)
+	local root = resolveInstance(payload and payload.root) or game
+	local attr = payload and payload.attribute
+	if not attr then error("find_by_attribute requires payload.attribute") end
+	local hasEquals = payload and payload.equals ~= nil
+	local limit = (payload and payload.limit) or 100
+	local results = {}
+	walkDescendants(root, function(node)
+		local ok, value = pcall(function() return node:GetAttribute(attr) end)
+		if ok and value ~= nil then
+			if not hasEquals or tostring(value) == tostring(payload.equals) then
+				results[#results + 1] = serialize(node, 1)
+				return #results >= limit
+			end
+		end
+		return false
+	end)
+	return { count = #results, results = results }
+end
+
+OPS.scan_proximity = function(payload)
+	local lp = Players.LocalPlayer
+	local char = lp and lp.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then error("no character/HumanoidRootPart (not spawned?)") end
+	local radius = (payload and payload.radius) or 50
+	local origin = hrp.Position
+	local prompts = {}
+	walkDescendants(workspace, function(node)
+		if node:IsA("ProximityPrompt") then
+			local parent = node.Parent
+			local pos
+			if parent and parent:IsA("BasePart") then pos = parent.Position
+			elseif parent and parent:IsA("Model") and parent.PrimaryPart then pos = parent.PrimaryPart.Position end
+			if pos then
+				local dist = (pos - origin).Magnitude
+				if dist <= radius then
+					prompts[#prompts + 1] = {
+						path = node:GetFullName(),
+						action_text = node.ActionText,
+						object_text = node.ObjectText,
+						distance = math.floor(dist * 10) / 10,
+						hold_duration = node.HoldDuration,
+						max_activation_distance = node.MaxActivationDistance,
+						enabled = node.Enabled,
+					}
+				end
+			end
+		end
+		return false
+	end)
+	table.sort(prompts, function(a, b) return a.distance < b.distance end)
+	return { count = #prompts, radius = radius, prompts = prompts }
+end
+
+OPS.scan_nil = function(_payload)
+	if typeof(getnilinstances) ~= "function" then
+		return { supported = false, reason = "getnilinstances not available in this client" }
+	end
+	local out = {}
+	for _, inst in ipairs(getnilinstances()) do
+		out[#out + 1] = serialize(inst, 1)
+		if #out >= 200 then break end
+	end
+	return { supported = true, count = #out, results = out }
+end
+
+OPS.hidden_property = function(payload)
+	local inst = resolveInstance(payload and payload.path)
+	if not inst then error("path not found: " .. tostring(payload and payload.path)) end
+	if typeof(gethiddenproperty) ~= "function" then
+		return { supported = false, reason = "gethiddenproperty not available in this client" }
+	end
+	local ok, value = pcall(gethiddenproperty, inst, payload and payload.prop)
+	if not ok then error(tostring(value)) end
+	return { supported = true, value = serialize(value, 2) }
+end
 -- Phase 1C adds OPS.execute. Nothing else belongs here in 1A.
 
 local function runOp(msg)
