@@ -1,0 +1,1 @@
+{"dependencies":{"ws":"^8.18.0"},"description":"devlink — local bridge/relay server (transport foundation, Phase 1A)","main":"server.js","name":"devlink","private":true,"scripts":{"start":"node server.js","test":"node test/run-tests.js"},"version":"0.1.0"}
