@@ -96,6 +96,49 @@ local function sendResult(requestId, ok, dataOrErr)
 	return res ~= nil
 end
 
+-- ============ shared serializer (JSON-safe, depth/width capped) ============
+local function serialize(value, depth, seen)
+	depth = depth or 2
+	local t = typeof(value)
+	if t == "nil" or t == "boolean" or t == "number" then return value end
+	if t == "string" then
+		if #value > 500 then return value:sub(1, 500) .. "…[truncated]" end
+		return value
+	end
+	if t == "Instance" then
+		local ok, full = pcall(function() return value:GetFullName() end)
+		return { __type = "Instance", class = value.ClassName, name = value.Name, path = ok and full or value.Name }
+	end
+	if t == "Vector3" then return { __type = "Vector3", x = value.X, y = value.Y, z = value.Z } end
+	if t == "CFrame" then
+		return { __type = "CFrame", x = value.Position.X, y = value.Position.Y, z = value.Position.Z }
+	end
+	if t == "EnumItem" then return { __type = "Enum", value = tostring(value) } end
+	if t == "table" then
+		if depth <= 0 then return { __type = "table", note = "depth limit" } end
+		seen = seen or {}
+		if seen[value] then return { __type = "table", note = "cycle" } end
+		seen[value] = true
+		local out = {}
+		if #value > 0 then
+			for i, v in ipairs(value) do
+				if i > 50 then out[51] = "…[truncated]" break end
+				out[i] = serialize(v, depth - 1, seen)
+			end
+		else
+			local count = 0
+			for k, v in pairs(value) do
+				count += 1
+				if count > 50 then out.__truncated = true break end
+				out[tostring(k)] = serialize(v, depth - 1, seen)
+			end
+		end
+		seen[value] = nil
+		return out
+	end
+	return { __type = t, value = tostring(value) }
+end
+
 local OPS = {}
 OPS.ping = function(_payload)
 	local lp = Players.LocalPlayer
@@ -112,6 +155,60 @@ OPS.test_hang = function(payload)
 	local ms = tonumber(payload and payload.ms) or 10000
 	task.wait(ms / 1000)
 	return { slept_ms = ms }
+end
+
+-- Phase 1C: arbitrary Luau in the client (the research escape hatch — bound by
+-- the same principles + the server-side pre-flight gate as every other op).
+OPS.execute = function(payload)
+	local code = payload and payload.code
+	if type(code) ~= "string" then error("execute requires payload.code (string)") end
+	local prints = {}
+	local function capture(...)
+		if #prints >= 200 then return end
+		local parts = {}
+		for i = 1, select("#", ...) do parts[#parts + 1] = tostring(select(i, ...)) end
+		prints[#prints + 1] = table.concat(parts, " ")
+	end
+	local chunk, loadErr = loadstring(code)
+	if not chunk then
+		return { ok = false, error = "loadstring: " .. tostring(loadErr), prints = prints }
+	end
+	if setfenv then
+		local base = (getgenv and getgenv()) or _G
+		local env = setmetatable({ print = capture, warn = capture }, { __index = base })
+		pcall(setfenv, chunk, env)
+	end
+	local results = { pcall(chunk) }
+	local okCall = table.remove(results, 1)
+	if not okCall then
+		return { ok = false, error = tostring(results[1]), prints = prints }
+	end
+	local rets = {}
+	for i, v in ipairs(results) do rets[i] = serialize(v, 2) end
+	return { ok = true, returns = rets, prints = prints }
+end
+
+OPS.client_status = function(_payload)
+	local lp = Players.LocalPlayer
+	local out = {
+		place_id = game.PlaceId,
+		job_id = game.JobId,
+		client = clientName(),
+		protocol = PROTOCOL_VERSION,
+	}
+	if lp then
+		out.player = { name = lp.Name, user_id = lp.UserId, display_name = lp.DisplayName }
+		local char = lp.Character
+		if char then
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			local hrp = char:FindFirstChild("HumanoidRootPart")
+			if hum then
+				out.humanoid = { health = hum.Health, max_health = hum.MaxHealth, walkspeed = hum.WalkSpeed, jump_power = hum.JumpPower }
+			end
+			if hrp then out.position = { hrp.Position.X, hrp.Position.Y, hrp.Position.Z } end
+		end
+	end
+	return out
 end
 -- Phase 1C adds OPS.execute. Nothing else belongs here in 1A.
 
