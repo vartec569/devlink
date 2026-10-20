@@ -2,8 +2,19 @@
 
 A small local bridge/relay server: one Node process that links a controller
 to a client-side script over a dual transport (WebSocket + HTTP long-poll).
-**Current state: Phase 1A — transport foundation only.** No application
-tools yet; 1B adds a pre-flight safety filter, 1C adds the first real ops.
+**Current state: Phase 1B — transport + pre-flight safety gate.** No
+application tools yet; 1C adds the first real ops behind the same gate.
+
+## Pre-flight gate (1B)
+
+Every op passes through `sendOp`, and every `sendOp` first scans the op +
+payload against `crash_blacklist.json`. A match is refused with
+`blocked_by_preflight` and **never reaches the bridge**. The list is
+versioned: `version` + `last_modified` live in the file, every change is
+recorded in `crash_blacklist.changelog.md`, and `/api/status` surfaces
+`blacklist_version` so a stale or silently-edited list is visible.
+The file is re-read automatically when it changes (mtime check); a malformed
+file at startup is fatal — a broken safety gate never silently turns off.
 
 ## Run it
 
