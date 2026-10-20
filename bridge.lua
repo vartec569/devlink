@@ -448,6 +448,188 @@ OPS.hidden_property = function(payload)
 	if not ok then error(tostring(value)) end
 	return { supported = true, value = serialize(value, 2) }
 end
+
+-- ============ Wave: remotes & read-only spy ============
+local REMOTE_CLASSES = { RemoteEvent = true, RemoteFunction = true, BindableEvent = true, BindableFunction = true }
+
+local function collectRemotes(root)
+	local found = {}
+	walkDescendants(root or game, function(node)
+		if REMOTE_CLASSES[node.ClassName] then
+			found[#found + 1] = node
+		end
+		return false
+	end)
+	return found
+end
+
+OPS.list_remotes = function(payload)
+	local root = resolveInstance(payload and payload.root) or game
+	local out = {}
+	for _, inst in ipairs(collectRemotes(root)) do
+		out[#out + 1] = { name = inst.Name, class = inst.ClassName, path = inst:GetFullName() }
+	end
+	table.sort(out, function(a, b) return a.path < b.path end)
+	return { count = #out, remotes = out }
+end
+
+OPS.map_remote_topology = function(payload)
+	local root = resolveInstance(payload and payload.root) or game
+	local groups = {}
+	local totals = { RemoteEvent = 0, RemoteFunction = 0, BindableEvent = 0, BindableFunction = 0, all = 0 }
+	for _, inst in ipairs(collectRemotes(root)) do
+		local top = inst:GetFullName():split(".")[2] or "game"
+		groups[top] = groups[top] or { events = 0, functions = 0, bindables = 0 }
+		local g = groups[top]
+		if inst.ClassName == "RemoteEvent" then g.events += 1
+		elseif inst.ClassName == "RemoteFunction" then g.functions += 1
+		else g.bindables += 1 end
+		totals[inst.ClassName] += 1
+		totals.all += 1
+	end
+	return { totals = totals, groups = groups }
+end
+
+-- Read-only spy (point-2, Davin's decision): PASSIVE listeners only.
+-- RemoteEvent/BindableEvent signals accept extra Connect listeners without
+-- touching the game's own handlers. No hooks, no namecall interception:
+-- outgoing FireServer calls and RemoteFunction invocations are therefore NOT
+-- observable here — by design, not by omission.
+local function spyState()
+	S.spy = S.spy or { active = false, installed_at = nil, last_event_at = nil, event_count = 0, dropped = 0, entries = {}, connections = {} }
+	return S.spy
+end
+
+OPS.spy_remote = function(payload)
+	local action = (payload and payload.action) or "status"
+	local spy = spyState()
+	if action == "stop" then
+		for _, conn in ipairs(spy.connections) do pcall(function() conn:Disconnect() end) end
+		spy.connections = {}
+		spy.active = false
+		return { active = false, event_count = spy.event_count }
+	end
+	if action == "status" then
+		return {
+			active = spy.active,
+			installed_at = spy.installed_at,
+			last_event_at = spy.last_event_at,
+			event_count = spy.event_count,
+			dropped = spy.dropped,
+			buffered = #spy.entries,
+			coverage = "incoming RemoteEvent + BindableEvent only (passive listeners); outgoing calls and RemoteFunction invokes are not observable without hooks and stay unobserved",
+		}
+	end
+	if action == "read" then
+		local limit = (payload and payload.limit) or 100
+		local nameFilter = payload and payload.name_contains
+		local out = {}
+		for _, e in ipairs(spy.entries) do
+			if not nameFilter or string.find(e.name, nameFilter, 1, true) then
+				out[#out + 1] = e
+			end
+		end
+		while #out > limit do table.remove(out, 1) end
+		return { count = #out, total = spy.event_count, entries = out }
+	end
+	if action == "start" then
+		if spy.active then return { active = true, note = "already running", event_count = spy.event_count } end
+		spy.entries = {}
+		spy.event_count = 0
+		spy.dropped = 0
+		spy.installed_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+		local connected = 0
+		for _, inst in ipairs(collectRemotes(game)) do
+			local signal
+			if inst.ClassName == "RemoteEvent" then signal = inst.OnClientEvent
+			elseif inst.ClassName == "BindableEvent" then signal = inst.Event end
+			if signal then
+				local ok, conn = pcall(function()
+					return signal:Connect(function(...)
+						local args = {}
+						for i = 1, select("#", ...) do args[i] = serialize(select(i, ...), 1) end
+						spy.event_count += 1
+						spy.last_event_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+						spy.entries[#spy.entries + 1] = {
+							t = spy.last_event_at,
+							name = inst.Name,
+							class = inst.ClassName,
+							path = inst:GetFullName(),
+							args = args,
+						}
+						if #spy.entries > 500 then
+							table.remove(spy.entries, 1)
+							spy.dropped += 1
+						end
+					end)
+				end)
+				if ok and conn then
+					spy.connections[#spy.connections + 1] = conn
+					connected += 1
+				end
+			end
+		end
+		spy.active = true
+		return { active = true, listeners = connected, note = "passive listeners only — game handlers untouched" }
+	end
+	error("spy_remote: unknown action " .. tostring(action))
+end
+
+OPS.remote_handlers = function(payload)
+	local inst = resolveInstance(payload and payload.path)
+	if not inst then error("path not found: " .. tostring(payload and payload.path)) end
+	local out = { class = inst.ClassName, path = inst:GetFullName() }
+	if inst.ClassName == "RemoteFunction" then
+		local ok, cb = pcall(function() return inst.OnClientInvoke end)
+		out.callback_set = ok and cb ~= nil or false
+	elseif inst.ClassName == "BindableFunction" then
+		local ok, cb = pcall(function() return inst.OnInvoke end)
+		out.callback_set = ok and cb ~= nil or false
+	end
+	out.getconnections_supported = typeof(getconnections) == "function"
+	if out.getconnections_supported then
+		local signal
+		if inst.ClassName == "RemoteEvent" then signal = inst.OnClientEvent
+		elseif inst.ClassName == "BindableEvent" then signal = inst.Event end
+		if signal then
+			local ok, conns = pcall(getconnections, signal)
+			if ok and conns then out.connections = #conns end
+		end
+	end
+	return out
+end
+
+local function decodeArg(arg)
+	if type(arg) == "table" and arg.__path then
+		return resolveInstance(arg.__path)
+	end
+	return arg
+end
+
+OPS.fire_remote = function(payload)
+	local inst = resolveInstance(payload and payload.path)
+	if not inst then error("path not found: " .. tostring(payload and payload.path)) end
+	local args = {}
+	for i, a in ipairs((payload and payload.args) or {}) do args[i] = decodeArg(a) end
+	if inst.ClassName == "RemoteEvent" then
+		inst:FireServer(table.unpack(args))
+		return { fired = true, class = inst.ClassName }
+	elseif inst.ClassName == "RemoteFunction" then
+		local results = { inst:InvokeServer(table.unpack(args)) }
+		local rets = {}
+		for i, v in ipairs(results) do rets[i] = serialize(v, 2) end
+		return { fired = true, class = inst.ClassName, returns = rets }
+	elseif inst.ClassName == "BindableEvent" then
+		inst:Fire(table.unpack(args))
+		return { fired = true, class = inst.ClassName }
+	elseif inst.ClassName == "BindableFunction" then
+		local results = { inst:Invoke(table.unpack(args)) }
+		local rets = {}
+		for i, v in ipairs(results) do rets[i] = serialize(v, 2) end
+		return { fired = true, class = inst.ClassName, returns = rets }
+	end
+	error("not a remote: " .. inst.ClassName)
+end
 -- Phase 1C adds OPS.execute. Nothing else belongs here in 1A.
 
 local function runOp(msg)
