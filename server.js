@@ -230,6 +230,15 @@ const apiServer = http.createServer(async (req, res) => {
       sendJson(res, 200, result);
       return;
     }
+    if (req.method === "POST" && url.pathname === "/api/session/test-hang") {
+      // Diagnostic op (bridge sleeps payload.ms then replies). Exists to prove
+      // the timeout class and unknown_outcome live; not an application tool.
+      const body = await readBody(req);
+      const ms = Math.max(0, Math.min(60000, parseInt(body.ms || "10000", 10) || 0));
+      const result = await sendOp("test_hang", { ms }, 5000);
+      sendJson(res, 200, result);
+      return;
+    }
     sendJson(res, 404, { ok: false, error: "not_found" });
   } catch (e) {
     sendJson(res, 400, { ok: false, error: "bad_request" });
