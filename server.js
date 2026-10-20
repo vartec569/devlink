@@ -194,6 +194,16 @@ function deliverToBridge(msg) {
   return true;
 }
 
+// Timeout classes (locked in the plan): fast reads 5s, standard ops 15s,
+// heavy analysis 60s, screenshot 20s, video = duration + 30s buffer.
+const OP_TIMEOUTS = {
+  ping: 5000, client_status: 5000,
+  execute: 15000, fire_remote: 15000,
+  decompile_deep: 60000, scan_gc: 60000, scan_registry: 60000, files_deep: 60000,
+  screenshot: 20000,
+};
+function opTimeout(op) { return OP_TIMEOUTS[op] || 15000; }
+
 // Send an op to the bridge and await its result under the failure taxonomy.
 // timeoutMs per tool class (fast reads 5s, standard 15s, heavy 60s).
 function sendOp(op, payload, timeoutMs) {
@@ -297,6 +307,16 @@ const apiServer = http.createServer(async (req, res) => {
       const ms = Math.max(0, Math.min(60000, parseInt(body.ms || "10000", 10) || 0));
       const note = typeof body.note === "string" ? body.note.slice(0, 500) : undefined;
       const result = await sendOp("test_hang", note !== undefined ? { ms, note } : { ms }, 5000);
+      sendJson(res, 200, result);
+      return;
+    }
+    // Generic op endpoint (Phase 1C+): every bridge op is reachable here.
+    // Timeout class comes from OP_TIMEOUTS; every call passes the pre-flight
+    // gate inside sendOp — execute included, from its first day (Principle P4).
+    const opMatch = /^\/api\/op\/([a-z0-9_]+)$/.exec(url.pathname);
+    if (req.method === "POST" && opMatch) {
+      const body = await readBody(req);
+      const result = await sendOp(opMatch[1], body || {}, opTimeout(opMatch[1]));
       sendJson(res, 200, result);
       return;
     }
