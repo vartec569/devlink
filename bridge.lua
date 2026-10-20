@@ -630,6 +630,555 @@ OPS.fire_remote = function(payload)
 	end
 	error("not a remote: " .. inst.ClassName)
 end
+
+-- ============ Wave: scripts & VM introspection (read-only) ============
+local function scriptList()
+	if typeof(getscripts) == "function" then
+		local ok, list = pcall(getscripts)
+		if ok and list then return list, "getscripts" end
+	end
+	local out = {}
+	walkDescendants(game, function(node)
+		if node:IsA("LuaSourceContainer") then out[#out + 1] = node end
+		return false
+	end)
+	return out, "walk (client-visible only)"
+end
+
+OPS.running_scripts = function(payload)
+	local list, source = scriptList()
+	local out = {}
+	for _, s in ipairs(list) do
+		out[#out + 1] = { name = s.Name, class = s.ClassName, path = s:GetFullName() }
+		if #out >= ((payload and payload.limit) or 500) then break end
+	end
+	return { count = #out, via = source, scripts = out }
+end
+
+OPS.loaded_modules = function(payload)
+	local out = {}
+	if typeof(getloadedmodules) == "function" then
+		local ok, list = pcall(getloadedmodules)
+		if ok and list then
+			for _, m in ipairs(list) do
+				out[#out + 1] = { name = m.Name, class = m.ClassName, path = m:GetFullName() }
+				if #out >= ((payload and payload.limit) or 500) then break end
+			end
+			return { count = #out, via = "getloadedmodules", modules = out }
+		end
+	end
+	walkDescendants(game, function(node)
+		if node.ClassName == "ModuleScript" then
+			out[#out + 1] = { name = node.Name, class = node.ClassName, path = node:GetFullName() }
+		end
+		return #out >= ((payload and payload.limit) or 500)
+	end)
+	return { count = #out, via = "walk (client-visible only)", modules = out }
+end
+
+local function tryDecompile(inst)
+	if typeof(decompile) ~= "function" then return nil, "decompile not available in this client" end
+	local ok, src = pcall(decompile, inst)
+	if not ok then return nil, tostring(src) end
+	return src, nil
+end
+
+OPS.decompile_deep = function(payload)
+	local mode = (payload and payload.mode) or "single"
+	if mode == "single" then
+		local inst = resolveInstance(payload and payload.path)
+		if not inst then error("path not found: " .. tostring(payload and payload.path)) end
+		local src, err = tryDecompile(inst)
+		if not src then
+			local out = { supported = false, reason = err }
+			if typeof(getscriptbytecode) == "function" then
+				local ok, bc = pcall(getscriptbytecode, inst)
+				if ok and bc then out.bytecode = { available = true, size = #bc } end
+			end
+			return out
+		end
+		return { supported = true, path = inst:GetFullName(), source = src }
+	end
+	if mode == "search" or mode == "comms_map" then
+		local query = payload and payload.query
+		if mode == "search" and not query then error("decompile_deep search requires payload.query") end
+		local list = scriptList()
+		local maxScan = (payload and payload.max_scan) or 50
+		local matches = {}
+		local scanned = 0
+		for _, s in ipairs(list) do
+			if scanned >= maxScan then break end
+			scanned += 1
+			local src = tryDecompile(s)
+			if src then
+				local lineNo = 0
+				for line in string.gmatch(src, "[^\r\n]+") do
+					lineNo += 1
+					local hit
+					if mode == "search" then
+						hit = string.find(line, query, 1, true) ~= nil
+					else
+						hit = string.find(line, "FireServer", 1, true) ~= nil or string.find(line, "InvokeServer", 1, true) ~= nil
+					end
+					if hit then
+						matches[#matches + 1] = { script = s:GetFullName(), line = lineNo, text = line:sub(1, 300) }
+						if #matches >= 200 then break end
+					end
+				end
+			end
+			if #matches >= 200 then break end
+		end
+		return { scanned = scanned, matches = matches, note = mode == "comms_map" and "call sites extracted from decompiled sources" or nil }
+	end
+	error("decompile_deep: unknown mode " .. tostring(mode))
+end
+
+OPS.script_env = function(payload)
+	local inst = resolveInstance(payload and payload.path)
+	if not inst then error("path not found: " .. tostring(payload and payload.path)) end
+	if typeof(getsenv) ~= "function" then return { supported = false, reason = "getsenv not available in this client" } end
+	local ok, env = pcall(getsenv, inst)
+	if not ok then error(tostring(env)) end
+	local keys = {}
+	local values = {}
+	for k, v in pairs(env) do
+		keys[#keys + 1] = tostring(k)
+		if type(v) ~= "function" then values[tostring(k)] = serialize(v, 1) end
+		if #keys >= 300 then break end
+	end
+	table.sort(keys)
+	return { supported = true, keys = keys, values = values }
+end
+
+OPS.roblox_env = function(_payload)
+	local function keyNames(t)
+		if type(t) ~= "table" then return nil end
+		local out = {}
+		for k in pairs(t) do
+			out[#out + 1] = tostring(k)
+			if #out >= 300 then break end
+		end
+		table.sort(out)
+		return out
+	end
+	local out = {}
+	if typeof(getgenv) == "function" then local ok, g = pcall(getgenv) if ok then out.genv_keys = keyNames(g) end end
+	if typeof(getrenv) == "function" then local ok, r = pcall(getrenv) if ok then out.renv_keys = keyNames(r) end end
+	return out
+end
+
+OPS.inspect_closure = function(payload)
+	local name = payload and payload.name
+	if not name then error("inspect_closure requires payload.name (a global function name)") end
+	local fn
+	if typeof(getgenv) == "function" then local ok, g = pcall(getgenv) if ok and g then fn = g[name] end end
+	if fn == nil and typeof(getrenv) == "function" then local ok, r = pcall(getrenv) if ok and r then fn = r[name] end end
+	if fn == nil then fn = _G[name] end
+	if type(fn) ~= "function" then return { found = false } end
+	local out = { found = true }
+	if typeof(getinfo) == "function" then
+		local ok, info = pcall(getinfo, fn)
+		if ok and info then out.info = serialize(info, 1) end
+	elseif debug and debug.info then
+		local ok, src, nm, np, va = pcall(debug.info, fn, "sna")
+		if ok then out.info = { source = src, name = nm, numparams = np, is_vararg = va } end
+	end
+	return out
+end
+
+OPS.debug_info = function(payload)
+	local inst = resolveInstance(payload and payload.path)
+	if not inst then error("path not found: " .. tostring(payload and payload.path)) end
+	local out = { class = inst.ClassName, path = inst:GetFullName() }
+	if typeof(getscripthash) == "function" then
+		local ok, h = pcall(getscripthash, inst)
+		if ok then out.hash = h end
+	end
+	if typeof(getscriptbytecode) == "function" then
+		local ok, bc = pcall(getscriptbytecode, inst)
+		if ok and bc then out.bytecode_size = #bc end
+	end
+	out.decompile_supported = typeof(decompile) == "function"
+	return out
+end
+
+OPS.scan_gc = function(payload)
+	if typeof(getgc) ~= "function" then return { supported = false, reason = "getgc not available in this client" } end
+	local ok, gc = pcall(getgc, true)
+	if not ok then error(tostring(gc)) end
+	local counts = {}
+	local samples = {}
+	local contains = payload and payload.contains
+	local limit = (payload and payload.limit) or 50
+	for _, v in ipairs(gc) do
+		local t = typeof(v)
+		counts[t] = (counts[t] or 0) + 1
+		if contains and t == "function" and #samples < limit then
+			if typeof(getinfo) == "function" then
+				local okInfo, info = pcall(getinfo, v)
+				if okInfo and info and info.name and string.find(info.name, contains, 1, true) then
+					samples[#samples + 1] = { name = info.name, source = info.source or info.short_src }
+				end
+			end
+		end
+	end
+	return { supported = true, total = #gc, counts = counts, samples = samples }
+end
+
+OPS.scan_registry = function(_payload)
+	if typeof(getreg) ~= "function" then return { supported = false, reason = "getreg not available in this client" } end
+	local ok, reg = pcall(getreg)
+	if not ok then error(tostring(reg)) end
+	local keys = {}
+	for k in pairs(reg) do
+		keys[#keys + 1] = tostring(k)
+		if #keys >= 200 then break end
+	end
+	return { supported = true, key_count = #keys, keys_sample = keys }
+end
+
+OPS.unc_check = function(_payload)
+	local probes = { "getgenv", "getrenv", "getgc", "getreg", "getscripts", "getloadedmodules", "getsenv", "gethui", "getinstances", "getnilinstances", "gethiddenproperty", "getconnections", "getinfo", "decompile", "getscriptbytecode", "getscripthash", "loadstring", "setfenv", "getfenv", "fireproximityprompt", "firetouchinterest", "fireclickdetector", "writefile", "readfile", "listfiles", "makefolder", "delfile", "setclipboard", "queue_on_teleport", "identifyexecutor", "HttpGet", "request", "WebSocket" }
+	local present, missing = {}, {}
+	for _, name in ipairs(probes) do
+		local v = _G[name]
+		if v == nil and typeof(getgenv) == "function" then local ok, g = pcall(getgenv) if ok and g then v = g[name] end end
+		if v ~= nil then present[#present + 1] = name else missing[#missing + 1] = name end
+	end
+	return { present = present, missing = missing, percent = math.floor(#present / #probes * 100 + 0.5) }
+end
+
+OPS.sandbox = function(_payload)
+	local function has(name)
+		local v = _G[name]
+		if v == nil and typeof(getgenv) == "function" then local ok, g = pcall(getgenv) if ok and g then v = g[name] end end
+		return v ~= nil
+	end
+	return {
+		client = clientName(),
+		has_loadstring = typeof(loadstring) == "function",
+		has_setfenv = typeof(setfenv) == "function",
+		has_getfenv = typeof(getfenv) == "function",
+		has_request = typeof(request) == "function" or typeof(http_request) == "function" or (syn ~= nil and typeof(syn.request) == "function"),
+		has_websocket = typeof(WebSocket) == "table",
+		has_syn = syn ~= nil,
+		has_krnl = krnl ~= nil,
+		user_id = Players.LocalPlayer and Players.LocalPlayer.UserId or nil,
+	}
+end
+
+-- ============ Wave: GUI, screen, console, files, interaction ============
+OPS.gui_tree = function(payload)
+	local rootPath = (payload and payload.root) or "LocalPlayer.PlayerGui"
+	local sub = { root = rootPath, max_depth = (payload and payload.max_depth) or 3, max_nodes = (payload and payload.max_nodes) or 500 }
+	return OPS.walk_tree(sub)
+end
+
+OPS.screen_text = function(payload)
+	local gui = Players.LocalPlayer and Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not gui then return { count = 0, texts = {} } end
+	local out = {}
+	walkDescendants(gui, function(node)
+		if node:IsA("TextLabel") or node:IsA("TextButton") or node:IsA("TextBox") then
+			if node.Text and node.Text ~= "" then
+				out[#out + 1] = { path = node:GetFullName(), class = node.ClassName, text = node.Text:sub(1, 300) }
+			end
+		end
+		return #out >= ((payload and payload.limit) or 300)
+	end)
+	return { count = #out, texts = out }
+end
+
+OPS.world_to_screen = function(payload)
+	local cam = workspace.CurrentCamera
+	if not cam then error("no CurrentCamera") end
+	local pos
+	if payload and payload.path then
+		local inst = resolveInstance(payload.path)
+		if not inst then error("path not found") end
+		if inst:IsA("BasePart") then pos = inst.Position
+		elseif inst:IsA("Model") and inst.PrimaryPart then pos = inst.PrimaryPart.Position
+		else error("instance has no position") end
+	else
+		pos = Vector3.new(payload.x or 0, payload.y or 0, payload.z or 0)
+	end
+	local v, onScreen = cam:WorldToViewportPoint(pos)
+	return { on_screen = onScreen, x = v.X, y = v.Y, depth = v.Z }
+end
+
+OPS.screenshot = function(_payload)
+	return { supported = false, reason = "no client screenshot API in this environment (checked: no screenshot/takescreenshot global)" }
+end
+
+OPS.video = function(_payload)
+	return { supported = false, reason = "no client video capture API in this environment" }
+end
+
+OPS.console = function(payload)
+	local log = game:GetService("LogService")
+	local ok, history = pcall(function() return log:GetLogHistory() end)
+	if not ok then error(tostring(history)) end
+	local limit = (payload and payload.limit) or 100
+	local out = {}
+	local start = math.max(1, #history - limit + 1)
+	for i = start, #history do
+		local e = history[i]
+		out[#out + 1] = { message = tostring(e.message), kind = tostring(e.messageType), time = e.timestamp }
+	end
+	return { count = #out, entries = out }
+end
+
+OPS.files_deep = function(payload)
+	local action = (payload and payload.action) or "list"
+	if action == "list" then
+		if typeof(listfiles) ~= "function" then return { supported = false, reason = "listfiles not available" } end
+		local ok, files = pcall(listfiles, (payload and payload.path) or "")
+		if not ok then error(tostring(files)) end
+		return { supported = true, files = files }
+	end
+	if action == "read" then
+		if typeof(readfile) ~= "function" then return { supported = false, reason = "readfile not available" } end
+		local ok, content = pcall(readfile, payload and payload.path)
+		if not ok then error(tostring(content)) end
+		if #content > 100000 then content = content:sub(1, 100000) .. "…[truncated]" end
+		return { supported = true, content = content }
+	end
+	if action == "write" then
+		if typeof(writefile) ~= "function" then return { supported = false, reason = "writefile not available" } end
+		local ok, err = pcall(writefile, payload and payload.path, (payload and payload.content) or "")
+		if not ok then error(tostring(err)) end
+		return { supported = true, written = true }
+	end
+	if action == "grep" then
+		if typeof(listfiles) ~= "function" or typeof(readfile) ~= "function" or typeof(isfile) ~= "function" then
+			return { supported = false, reason = "listfiles/readfile/isfile not available" }
+		end
+		local query = payload and payload.query
+		if not query then error("files_deep grep requires payload.query") end
+		local root = (payload and payload.path) or ""
+		local matches = {}
+		local scanned = 0
+		local function scan(folder)
+			if scanned >= 200 or #matches >= 200 then return end
+			local ok, items = pcall(listfiles, folder)
+			if not ok then return end
+			for _, item in ipairs(items) do
+				if scanned >= 200 or #matches >= 200 then break end
+				local okFile, isF = pcall(isfile, item)
+				if okFile and isF then
+					scanned += 1
+					local okRead, content = pcall(readfile, item)
+					if okRead and content then
+						local lineNo = 0
+						for line in string.gmatch(content, "[^\r\n]+") do
+							lineNo += 1
+							if string.find(line, query, 1, true) then
+								matches[#matches + 1] = { file = item, line = lineNo, text = line:sub(1, 300) }
+								if #matches >= 200 then break end
+							end
+						end
+					end
+				elseif okFile and not isF then
+					scan(item)
+				end
+			end
+		end
+		scan(root)
+		return { supported = true, scanned_files = scanned, matches = matches }
+	end
+	error("files_deep: unknown action " .. tostring(action))
+end
+
+local function localHumanoid()
+	local lp = Players.LocalPlayer
+	local char = lp and lp.Character
+	return char and char:FindFirstChildOfClass("Humanoid"), char
+end
+
+OPS.click_button = function(payload)
+	local inst = resolveInstance(payload and payload.path)
+	if not inst then error("path not found: " .. tostring(payload and payload.path)) end
+	if typeof(firesignal) ~= "function" then return { supported = false, reason = "firesignal not available in this client" } end
+	local signalName = (payload and payload.signal) or "Activated"
+	local ok, err = pcall(firesignal, inst[signalName])
+	if not ok then error(tostring(err)) end
+	return { supported = true, fired = signalName }
+end
+
+OPS.fire_signal = function(payload)
+	local inst = resolveInstance(payload and payload.path)
+	if not inst then error("path not found: " .. tostring(payload and payload.path)) end
+	if typeof(firesignal) ~= "function" then return { supported = false, reason = "firesignal not available in this client" } end
+	if not (payload and payload.signal) then error("fire_signal requires payload.signal") end
+	local args = (payload and payload.args) or {}
+	local ok, err = pcall(firesignal, inst[payload.signal], table.unpack(args))
+	if not ok then error(tostring(err)) end
+	return { supported = true, fired = payload.signal }
+end
+
+OPS.interact_prompts = function(payload)
+	if typeof(fireproximityprompt) ~= "function" then return { supported = false, reason = "fireproximityprompt not available in this client" } end
+	local target
+	if payload and payload.path then
+		target = resolveInstance(payload.path)
+	else
+		local scan = OPS.scan_proximity({ radius = (payload and payload.radius) or 30 })
+		if scan.count == 0 then return { fired = false, reason = "no prompt in radius" } end
+		target = resolveInstance(scan.prompts[1].path)
+	end
+	if not target then error("prompt not found") end
+	local ok, err = pcall(fireproximityprompt, target)
+	if not ok then error(tostring(err)) end
+	return { fired = true, path = target:GetFullName() }
+end
+
+OPS.send_chat = function(payload)
+	local message = payload and payload.message
+	if type(message) ~= "string" then error("send_chat requires payload.message") end
+	local tcs = game:GetService("TextChatService")
+	local channel = tcs and tcs:FindFirstChild("TextChannels") and tcs.TextChannels:FindFirstChild("RBXGeneral")
+	if channel then
+		local ok, err = pcall(function() channel:SendAsync(message) end)
+		if ok then return { sent = true, via = "TextChatService.RBXGeneral" } end
+		return { sent = false, reason = tostring(err) }
+	end
+	local rep = game:GetService("ReplicatedStorage")
+	local say = rep and rep:FindFirstChild("SayMessageRequest", true)
+	if say then
+		say:FireServer(message, "All")
+		return { sent = true, via = "legacy SayMessageRequest" }
+	end
+	return { sent = false, reason = "no chat channel found" }
+end
+
+OPS.move = function(payload)
+	local hum, char = localHumanoid()
+	if not hum then error("no humanoid") end
+	local dest
+	if payload and payload.path then
+		local inst = resolveInstance(payload.path)
+		if not inst then error("path not found") end
+		if inst:IsA("BasePart") then dest = inst.Position
+		elseif inst:IsA("Model") and inst.PrimaryPart then dest = inst.PrimaryPart.Position
+		else error("target has no position") end
+	elseif payload and payload.x then
+		dest = Vector3.new(payload.x, payload.y or 0, payload.z or 0)
+	else
+		error("move requires payload.path or payload.x/y/z")
+	end
+	hum:MoveTo(dest)
+	return { moving = true, destination = { dest.X, dest.Y, dest.Z } }
+end
+
+OPS.set_position = function(payload)
+	local _, char = localHumanoid()
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then error("no HumanoidRootPart") end
+	local before = hrp.Position
+	hrp.CFrame = CFrame.new(payload.x or before.X, payload.y or before.Y, payload.z or before.Z)
+	return { set = true, from = { before.X, before.Y, before.Z }, to = { hrp.Position.X, hrp.Position.Y, hrp.Position.Z } }
+end
+
+OPS.camera = function(payload)
+	local cam = workspace.CurrentCamera
+	if not cam then error("no CurrentCamera") end
+	if (payload and payload.mode) == "set" then
+		if payload.look_at and payload.position then
+			cam.CFrame = CFrame.lookAt(
+				Vector3.new(payload.position[1], payload.position[2], payload.position[3]),
+				Vector3.new(payload.look_at[1], payload.look_at[2], payload.look_at[3]))
+		end
+		if payload.fov then cam.FieldOfView = payload.fov end
+		return { set = true }
+	end
+	local pos = cam.CFrame.Position
+	local look = cam.CFrame.LookVector
+	return {
+		position = { pos.X, pos.Y, pos.Z },
+		look = { look.X, look.Y, look.Z },
+		fov = cam.FieldOfView,
+		camera_type = tostring(cam.CameraType),
+	}
+end
+
+OPS.set_player = function(payload)
+	local hum = localHumanoid()
+	if not hum then error("no humanoid") end
+	S.tracked = S.tracked or {}
+	local applied = {}
+	for _, prop in ipairs({ "WalkSpeed", "JumpPower", "Health" }) do
+		local key = string.lower(prop)
+		local value = payload and (payload[key] or payload[prop])
+		if value ~= nil then
+			hum[prop] = value
+			S.tracked["humanoid." .. prop] = true
+			applied[#applied + 1] = prop
+		end
+	end
+	return { applied = applied }
+end
+
+OPS.get_tracked = function(_payload)
+	local keys = {}
+	for k in pairs(S.tracked or {}) do keys[#keys + 1] = k end
+	if OPS and true then keys[#keys + 1] = "position" end
+	table.sort(keys)
+	return { tracked_keys = keys }
+end
+
+OPS.restore_state = function(payload)
+	local applied = {}
+	if payload and payload.position then
+		local _, char = localHumanoid()
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			hrp.CFrame = CFrame.new(payload.position[1], payload.position[2], payload.position[3])
+			applied[#applied + 1] = "position"
+		end
+	end
+	if payload and payload.humanoid then
+		local hum = localHumanoid()
+		if hum then
+			for prop, value in pairs(payload.humanoid) do
+				local ok = pcall(function() hum[prop] = value end)
+				if ok then applied[#applied + 1] = "humanoid." .. prop end
+			end
+		end
+	end
+	return { applied = applied, note = "best-effort restore — verify with a fresh snapshot compare" }
+end
+
+OPS.anti_afk = function(_payload)
+	local hum, char = localHumanoid()
+	if not hum then error("no humanoid") end
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	hum.Jump = true
+	if hrp then
+		local look = hrp.CFrame.LookVector
+		hum:MoveTo(hrp.Position + look * 2)
+	end
+	return { nudged = true, via = "humanoid jump+move (no VirtualUser)" }
+end
+
+OPS.join_game = function(payload)
+	local placeId = payload and payload.place_id
+	if not placeId then error("join_game requires payload.place_id") end
+	local ts = game:GetService("TeleportService")
+	local lp = Players.LocalPlayer
+	local ok, err
+	if payload.job_id and typeof(TeleportOptions) == "Instance" then
+		local opts = Instance.new("TeleportOptions")
+		local okSet = pcall(function() opts:SetJobId(payload.job_id) end)
+		if okSet then
+			ok, err = pcall(function() return ts:TeleportAsync(placeId, { lp }, opts) end)
+		end
+	end
+	if not ok then
+		ok, err = pcall(function() return ts:TeleportAsync(placeId, { lp }) end)
+	end
+	if not ok then error(tostring(err)) end
+	return { teleporting = true, place_id = placeId }
+end
 -- Phase 1C adds OPS.execute. Nothing else belongs here in 1A.
 
 local function runOp(msg)
