@@ -6,6 +6,11 @@
 -- Trust model: this channel is localhost-only; the session nonce issued at
 -- handshake is a session nonce (prevents cross-session mixups), not a credential.
 -- Protocol "1.0". Heartbeat: server declares the session dead after 10s silent.
+--
+-- Debug knob (set from the client console, read live):
+--   getgenv().__devlinkTransport = "poll"  -> force the long-poll fallback
+--   getgenv().__devlinkTransport = "ws"    -> force back to WebSocket
+--   getgenv().__devlinkTransport = nil     -> auto (default)
 
 local PROTOCOL_VERSION = "1.0"
 local HOST = "127.0.0.1"
@@ -100,6 +105,13 @@ OPS.ping = function(_payload)
 		job_id = game.JobId,
 		player = lp and lp.Name or nil,
 	}
+end
+-- Diagnostic op: sleeps, then replies. Exists to prove timeout classes,
+-- unknown_outcome, and the watchdog's "done, result discarded" path live.
+OPS.test_hang = function(payload)
+	local ms = tonumber(payload and payload.ms) or 10000
+	task.wait(ms / 1000)
+	return { slept_ms = ms }
 end
 -- Phase 1C adds OPS.execute. Nothing else belongs here in 1A.
 
@@ -215,7 +227,7 @@ local function pollLoop()
 	S.nonce = ack.session_nonce
 	S.pollMode = true
 	log("connected via long-poll, session", ack.session_id, ack.resumed and "(resumed)" or "")
-	while S.pollMode and S.sessionId do
+	while S.pollMode and S.sessionId and env.__devlinkTransport ~= "ws" do
 		S.aliveAt = os.clock()
 		local url = ("%s/bridge/poll?session_id=%s&nonce=%s"):format(BASE, S.sessionId, S.nonce)
 		local r = httpRequest({ Url = url, Method = "GET" })
@@ -252,10 +264,16 @@ task.spawn(function()
 	local backoff = 1
 	while true do
 		S.aliveAt = os.clock()
-		local connected = wsConnect()
-		if connected then
-			backoff = 1
-			while S.wsOpen do task.wait(1); S.aliveAt = os.clock() end
+		if env.__devlinkTransport ~= "poll" then
+			local connected = wsConnect()
+			if connected then
+				backoff = 1
+				while S.wsOpen and env.__devlinkTransport ~= "poll" do
+					task.wait(1); S.aliveAt = os.clock()
+				end
+				-- Transport was forced to poll while WS was open: close and fall through.
+				if S.wsOpen and S.ws then pcall(function() S.ws:Close() end) end
+			end
 		end
 		if not S.wsOpen then
 			if httpRequest({ Url = BASE .. "/bridge.lua", Method = "GET" }) then
