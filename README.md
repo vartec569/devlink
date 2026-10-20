@@ -2,8 +2,9 @@
 
 A small local bridge/relay server: one Node process that links a controller
 to a client-side script over a dual transport (WebSocket + HTTP long-poll).
-**Current state: Phase 1B — transport + pre-flight safety gate.** No
-application tools yet; 1C adds the first real ops behind the same gate.
+**Current state: full planned surface built** — transport (1A), pre-flight
+gate (1B), execute + client status (1C), and the structure / remote / script /
+GUI / interaction waves. Every op runs through the same gate.
 
 ## Pre-flight gate (1B)
 
@@ -42,6 +43,31 @@ One Node process, two listeners, two trust models:
   naming the listener (port + interface) instead of running half-alive.
 - If a call is in flight when the bridge dies, the caller gets
   `unknown_outcome` — never a guessed "failed".
+
+## Ops
+
+All ops: `POST /api/op/<name>` with a JSON payload (Bearer token required).
+Plus `GET /api/status`, `POST /api/session/ping`, and the snapshot trio
+`POST /api/session/snapshot` · `POST /api/session/compare` ·
+`POST /api/session/restore` (schema v1; restore touches only values the
+snapshot recorded as tracked — best-effort, verify with a compare).
+
+Bridge ops (54): ping, test_hang, execute, client_status, players, processes,
+replication, resolve_path, get_children, get_services, find_instances,
+walk_tree, read_properties, find_by_property, find_by_tag, find_by_attribute,
+scan_proximity, scan_nil, hidden_property, list_remotes, map_remote_topology,
+spy_remote, remote_handlers, fire_remote, running_scripts, loaded_modules,
+decompile_deep, script_env, roblox_env, inspect_closure, debug_info, scan_gc,
+scan_registry, unc_check, sandbox, gui_tree, screen_text, world_to_screen,
+screenshot, video, console, files_deep, click_button, fire_signal,
+interact_prompts, send_chat, move, set_position, camera, set_player,
+get_tracked, restore_state, anti_afk, join_game.
+
+Notes on honesty: `spy_remote` is READ-ONLY and passive (extra signal
+listeners; no hooks) — it sees incoming RemoteEvent/BindableEvent traffic
+only. `screenshot`, `video`, and `processes` answer `supported: false` with a
+reason instead of faking output; executor-dependent ops (decompile, getgc…)
+do the same when the client lacks the capability.
 
 ## Tests
 
