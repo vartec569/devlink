@@ -203,7 +203,7 @@ OPS.client_status = function(_payload)
 			local hum = char:FindFirstChildOfClass("Humanoid")
 			local hrp = char:FindFirstChild("HumanoidRootPart")
 			if hum then
-				out.humanoid = { health = hum.Health, max_health = hum.MaxHealth, walkspeed = hum.WalkSpeed, jump_power = hum.JumpPower }
+				out.humanoid = { health = hum.Health, max_health = hum.MaxHealth, walkspeed = hum.WalkSpeed, jump_power = hum.JumpPower, rig = tostring(hum.RigType) }
 			end
 			if hrp then out.position = { hrp.Position.X, hrp.Position.Y, hrp.Position.Z } end
 		end
@@ -212,6 +212,47 @@ OPS.client_status = function(_payload)
 end
 
 -- ============ Wave: structure search ============
+OPS.players = function(payload)
+	local out = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		out[#out + 1] = {
+			name = p.Name,
+			user_id = p.UserId,
+			display_name = p.DisplayName,
+			is_local = p == Players.LocalPlayer,
+			team = p.Team and p.Team.Name or nil,
+		}
+		if #out >= ((payload and payload.limit) or 200) then break end
+	end
+	return { count = #out, players = out }
+end
+
+OPS.processes = function(_payload)
+	-- Inside the client there is exactly one process: this one. OS-level
+	-- process listing is not reachable from the Lua bridge (same architectural
+	-- boundary as scan_memory_pattern).
+	return {
+		supported = false,
+		reason = "OS process listing is not available from inside the client; the bridge sees only its own session",
+		session = { place_id = game.PlaceId, job_id = game.JobId },
+	}
+end
+
+OPS.replication = function(_payload)
+	local out = {
+		streaming_enabled = workspace.StreamingEnabled,
+	}
+	local ok1, minR = pcall(function() return workspace.StreamingMinRadius end)
+	if ok1 then out.streaming_min_radius = minR end
+	local ok2, tgtR = pcall(function() return workspace.StreamingTargetRadius end)
+	if ok2 then out.streaming_target_radius = tgtR end
+	local lp = Players.LocalPlayer
+	if lp and lp.ReplicationFocus then
+		out.replication_focus = lp.ReplicationFocus:GetFullName()
+	end
+	return out
+end
+
 local function resolveInstance(path)
 	if type(path) ~= "string" or path == "" or path == "game" then return game end
 	local segments = string.split(path, ".")
@@ -1119,9 +1160,10 @@ OPS.set_player = function(payload)
 end
 
 OPS.get_tracked = function(_payload)
-	local keys = {}
+	-- Restore boundary: "position" is always tracked (snapshot schema field);
+	-- humanoid.* keys appear once set_player has changed them.
+	local keys = { "position" }
 	for k in pairs(S.tracked or {}) do keys[#keys + 1] = k end
-	if OPS and true then keys[#keys + 1] = "position" end
 	table.sort(keys)
 	return { tracked_keys = keys }
 end
@@ -1165,19 +1207,22 @@ OPS.join_game = function(payload)
 	if not placeId then error("join_game requires payload.place_id") end
 	local ts = game:GetService("TeleportService")
 	local lp = Players.LocalPlayer
-	local ok, err
-	if payload.job_id and typeof(TeleportOptions) == "Instance" then
-		local opts = Instance.new("TeleportOptions")
-		local okSet = pcall(function() opts:SetJobId(payload.job_id) end)
-		if okSet then
-			ok, err = pcall(function() return ts:TeleportAsync(placeId, { lp }, opts) end)
+	local opts
+	if payload.job_id then
+		local okOpts, o = pcall(Instance.new, "TeleportOptions")
+		if okOpts and o then
+			-- Verified via live API dump 2026-10-20: job targeting is the
+			-- ServerInstanceId property; TeleportToPlaceInstance is deprecated.
+			local okSet = pcall(function() o.ServerInstanceId = payload.job_id end)
+			if okSet then opts = o end
 		end
 	end
-	if not ok then
-		ok, err = pcall(function() return ts:TeleportAsync(placeId, { lp }) end)
-	end
+	local ok, err = pcall(function()
+		if opts then return ts:TeleportAsync(placeId, { lp }, opts) end
+		return ts:TeleportAsync(placeId, { lp })
+	end)
 	if not ok then error(tostring(err)) end
-	return { teleporting = true, place_id = placeId }
+	return { teleporting = true, place_id = placeId, job_targeted = opts ~= nil }
 end
 -- Phase 1C adds OPS.execute. Nothing else belongs here in 1A.
 
