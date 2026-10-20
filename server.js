@@ -50,6 +50,59 @@ let session = null; // {id, nonce, protocolVersion, protocolNote, client, transp
 let requestCounter = 0;
 const pending = new Map(); // request_id -> {resolve, timer, op, startedAt}
 
+// ---------- pre-flight crash blacklist (Phase 1B) ----------
+// crash_blacklist.json is versioned + changelogged (see crash_blacklist.changelog.md).
+// The gate sits in sendOp — the single funnel every op passes through — so a
+// blocked payload NEVER reaches the bridge. Reload is by mtime check: editing
+// the file takes effect without a restart; a malformed edit keeps the last
+// good list and logs loudly; a malformed file at STARTUP is fatal (fail-fast:
+// a corrupt safety file must never silently disable the gate).
+const BLACKLIST_PATH = process.env.DL_BLACKLIST || path.join(__dirname, "crash_blacklist.json");
+let blacklist = { version: 0, last_modified: null, entries: [], compiled: [] };
+let blacklistMtime = -1;
+
+function loadBlacklist(initial) {
+  let stat;
+  try { stat = fs.statSync(BLACKLIST_PATH); } catch (_) {
+    if (initial) console.log("[devlink] no crash_blacklist.json found — pre-flight gate running with an EMPTY list");
+    blacklist = { version: 0, last_modified: null, entries: [], compiled: [] };
+    blacklistMtime = -1;
+    return;
+  }
+  if (stat.mtimeMs === blacklistMtime) return;
+  const parsed = JSON.parse(fs.readFileSync(BLACKLIST_PATH, "utf8"));
+  if (typeof parsed.version !== "number" || !Array.isArray(parsed.entries)) {
+    throw new Error("crash_blacklist.json: expected {version: number, entries: [...]}");
+  }
+  const compiled = parsed.entries.map((e) => {
+    if (!e.id || !e.kind || !e.pattern) throw new Error("crash_blacklist.json: every entry needs id, kind, pattern");
+    return { ...e, re: e.kind === "regex" ? new RegExp(e.pattern) : null };
+  });
+  blacklist = { version: parsed.version, last_modified: parsed.last_modified || null, entries: parsed.entries, compiled };
+  blacklistMtime = stat.mtimeMs;
+  console.log(`[devlink] crash blacklist loaded: v${blacklist.version} (${compiled.length} entries, modified ${blacklist.last_modified})`);
+}
+try {
+  loadBlacklist(true);
+} catch (e) {
+  console.error(`[devlink] FATAL: crash_blacklist.json is malformed (${e.message}). Refusing to start with a broken safety gate.`);
+  process.exit(1);
+}
+
+function preflight(op, payload) {
+  try { loadBlacklist(false); } catch (e) {
+    console.error(`[devlink] ERROR: crash_blacklist.json reload failed (${e.message}) — keeping v${blacklist.version}`);
+  }
+  if (!blacklist.compiled.length) return null;
+  const text = op + "\n" + JSON.stringify(payload || {});
+  for (const e of blacklist.compiled) {
+    if (e.kind === "op" && e.pattern === op) return e;
+    if (e.kind === "substring" && text.includes(e.pattern)) return e;
+    if (e.kind === "regex" && e.re.test(text)) return e;
+  }
+  return null;
+}
+
 function nowMs() { return Date.now(); }
 
 function resolvePending(id, value) {
@@ -145,6 +198,12 @@ function deliverToBridge(msg) {
 // timeoutMs per tool class (fast reads 5s, standard 15s, heavy 60s).
 function sendOp(op, payload, timeoutMs) {
   return new Promise((resolve) => {
+    const hit = preflight(op, payload);
+    if (hit) {
+      console.log(`[devlink] pre-flight BLOCKED op "${op}" by blacklist entry "${hit.id}" (v${blacklist.version})`);
+      resolve({ ok: false, outcome: "blocked_by_preflight", entry: hit.id, reason: hit.reason });
+      return;
+    }
     if (!session) { resolve({ ok: false, outcome: "no_session" }); return; }
     const id = "req-" + (++requestCounter) + "-" + crypto.randomBytes(3).toString("hex");
     const startedAt = nowMs();
@@ -208,6 +267,7 @@ const apiServer = http.createServer(async (req, res) => {
         protocol_version: PROTOCOL_VERSION,
         uptime_s: Math.floor(process.uptime()),
         heartbeat: { interval_ms: HEARTBEAT_MS, dead_after_ms: DEAD_AFTER_MS },
+        blacklist: { version: blacklist.version, last_modified: blacklist.last_modified, entries: blacklist.entries.length },
         listeners: {
           api: { bind: API_BIND, port: API_PORT },
           bridge: { bind: BRIDGE_BIND, port: BRIDGE_PORT },
@@ -235,7 +295,8 @@ const apiServer = http.createServer(async (req, res) => {
       // the timeout class and unknown_outcome live; not an application tool.
       const body = await readBody(req);
       const ms = Math.max(0, Math.min(60000, parseInt(body.ms || "10000", 10) || 0));
-      const result = await sendOp("test_hang", { ms }, 5000);
+      const note = typeof body.note === "string" ? body.note.slice(0, 500) : undefined;
+      const result = await sendOp("test_hang", note !== undefined ? { ms, note } : { ms }, 5000);
       sendJson(res, 200, result);
       return;
     }
