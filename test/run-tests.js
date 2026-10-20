@@ -201,6 +201,48 @@ function wsHello(version, nonce) {
   check("blocked execute never reached the bridge",
     !opsSeen.some((m) => m.op === "execute" && m.payload && m.payload.code === "while true do end"), opsSeen.length);
 
+  // --- Snapshots (schema v1): capture, compare, schema refusal, restore boundary ---
+  async function answerNextOp(opName, data) {
+    const found = await new Promise((resolve) => {
+      const iv = setInterval(() => {
+        const m = opsSeen.find((x) => x.op === opName && !x.__answered);
+        if (m) { m.__answered = true; clearInterval(iv); resolve(m); }
+      }, 40);
+      setTimeout(() => { clearInterval(iv); resolve(null); }, 4000);
+    });
+    if (found) b1.ws.send(JSON.stringify({ type: "op_result", request_id: found.request_id, nonce: nonce1, ok: true, data }));
+    return found;
+  }
+  const statusData = (ws) => ({ place_id: 123, job_id: "job-1", position: [10.04, 70, -353.02], humanoid: { health: 100, max_health: 100, walkspeed: ws, jump_power: 50, rig: "Enum.HumanoidRigType.R15" } });
+  const snap1Promise = api("/api/session/snapshot", { method: "POST", body: { label: "test-a" } }, token);
+  await answerNextOp("client_status", statusData(16));
+  await answerNextOp("get_tracked", { tracked_keys: ["position", "humanoid.WalkSpeed"] });
+  const snap1 = await snap1Promise;
+  check("snapshot schema v1: rounded position, clean rig, tracked values filled",
+    snap1.json.ok === true && snap1.json.snapshot.schema_version === 1 &&
+    snap1.json.snapshot.player.position[0] === 10 && snap1.json.snapshot.player.rig === "R15" &&
+    snap1.json.snapshot.tracked["humanoid.WalkSpeed"] === 16, snap1.json.snapshot);
+
+  const snap2Promise = api("/api/session/snapshot", { method: "POST", body: {} }, token);
+  await answerNextOp("client_status", statusData(24));
+  await answerNextOp("get_tracked", { tracked_keys: ["position", "humanoid.WalkSpeed"] });
+  const snap2 = await snap2Promise;
+  const cmp = await api("/api/session/compare", { method: "POST", body: { a: snap1.json.snapshot.snapshot_id, b: snap2.json.snapshot.snapshot_id } }, token);
+  check("compare diffs by path (walkspeed 16 -> 24)",
+    cmp.json.ok === true && cmp.json.identical === false &&
+    cmp.json.diffs.some((d) => d.path === "player.walkspeed" && d.from === 16 && d.to === 24), cmp.json);
+  const cmpBad = await api("/api/session/compare", { method: "POST", body: { a: snap1.json.snapshot, b: { ...snap1.json.snapshot, schema_version: 2 } } }, token);
+  check("compare refuses a different schema_version",
+    cmpBad.json.ok === false && cmpBad.json.outcome === "schema_mismatch", cmpBad.json);
+
+  const restorePromise = api("/api/session/restore", { method: "POST", body: { snapshot_id: snap1.json.snapshot.snapshot_id } }, token);
+  const restoreOp = await answerNextOp("restore_state", { applied: ["position", "humanoid.WalkSpeed"] });
+  check("restore sends ONLY tracked values (position + WalkSpeed 16)",
+    !!restoreOp && restoreOp.payload.humanoid && restoreOp.payload.humanoid.WalkSpeed === 16 && Array.isArray(restoreOp.payload.position), restoreOp && restoreOp.payload);
+  const restoreRes = await restorePromise;
+  check("restore reply carries the best-effort note",
+    restoreRes.json.ok === true && /best-effort/.test(restoreRes.json.note || ""), restoreRes.json);
+
   // --- unknown_outcome: bridge dies mid-call ---
   const ping2 = api("/api/session/ping", { method: "POST", body: {} }, token);
   await new Promise((resolve) => {
