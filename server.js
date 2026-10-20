@@ -255,6 +255,82 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
+// ---------- session snapshots (schema v1 — locked in the plan) ----------
+// Fields: schema_version, captured_at (epoch s), place_id, job_id,
+// player{position [x,y,z] rounded 0.1, health, max_health, walkspeed,
+// jump_power, rig}, tracked{key -> scalar} (ONLY props our own tools set —
+// the restore boundary), skipped_count. Scalars only; anything else is
+// skipped AND counted, never silently dropped.
+const snapshots = new Map();
+let snapshotCounter = 0;
+const round1 = (n) => Math.round(n * 10) / 10;
+
+async function captureSnapshot(label) {
+  const cs = await sendOp("client_status", {}, 5000);
+  if (!cs.ok) return cs;
+  const gt = await sendOp("get_tracked", {}, 5000);
+  const d = cs.data || {};
+  const hum = d.humanoid || {};
+  const keys = (gt.ok && gt.data && Array.isArray(gt.data.tracked_keys)) ? gt.data.tracked_keys : ["position"];
+  const snap = {
+    schema_version: 1,
+    snapshot_id: "snap-" + (++snapshotCounter),
+    label: label || null,
+    captured_at: Math.floor(Date.now() / 1000),
+    place_id: d.place_id != null ? d.place_id : null,
+    job_id: d.job_id || null,
+    player: {
+      position: Array.isArray(d.position) ? d.position.map(round1) : null,
+      health: hum.health != null ? round1(hum.health) : null,
+      max_health: hum.max_health != null ? round1(hum.max_health) : null,
+      walkspeed: hum.walkspeed != null ? round1(hum.walkspeed) : null,
+      jump_power: hum.jump_power != null ? round1(hum.jump_power) : null,
+      rig: hum.rig ? String(hum.rig).replace("Enum.HumanoidRigType.", "") : null,
+    },
+    tracked: {},
+    skipped_count: 0,
+  };
+  for (const k of keys) {
+    if (k === "position") snap.tracked[k] = snap.player.position;
+    else if (k === "humanoid.WalkSpeed") snap.tracked[k] = snap.player.walkspeed;
+    else if (k === "humanoid.JumpPower") snap.tracked[k] = snap.player.jump_power;
+    else if (k === "humanoid.Health") snap.tracked[k] = snap.player.health;
+    else snap.skipped_count += 1; // tracked key with no status source: counted, not dropped silently
+  }
+  snapshots.set(snap.snapshot_id, snap);
+  return { ok: true, snapshot: snap };
+}
+
+function flattenSnapshot(s) {
+  const flat = {};
+  flat["place_id"] = s.place_id;
+  flat["job_id"] = s.job_id;
+  if (s.player) {
+    if (Array.isArray(s.player.position)) s.player.position.forEach((v, i) => { flat["player.position." + "xyz"[i]] = v; });
+    for (const k of ["health", "max_health", "walkspeed", "jump_power", "rig"]) {
+      if (s.player[k] !== undefined && s.player[k] !== null) flat["player." + k] = s.player[k];
+    }
+  }
+  for (const [k, v] of Object.entries(s.tracked || {})) {
+    flat["tracked." + k] = Array.isArray(v) ? v.join(",") : v;
+  }
+  return flat;
+}
+
+function compareSnapshots(a, b) {
+  if (a.schema_version !== b.schema_version) {
+    return { ok: false, outcome: "schema_mismatch", reason: `schema_version differs (${a.schema_version} vs ${b.schema_version}) — compare refused` };
+  }
+  const fa = flattenSnapshot(a), fb = flattenSnapshot(b);
+  const diffs = [];
+  for (const k of new Set([...Object.keys(fa), ...Object.keys(fb)])) {
+    const va = fa[k], vb = fb[k];
+    const eq = (typeof va === "number" && typeof vb === "number") ? round1(va) === round1(vb) : va === vb;
+    if (!eq) diffs.push({ path: k, from: va !== undefined ? va : null, to: vb !== undefined ? vb : null });
+  }
+  return { ok: true, identical: diffs.length === 0, diffs };
+}
+
 // ---------- API server (Tailscale-facing; trust = pre-shared secret) ----------
 const apiServer = http.createServer(async (req, res) => {
   try {
@@ -318,6 +394,41 @@ const apiServer = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const result = await sendOp(opMatch[1], body || {}, opTimeout(opMatch[1]));
       sendJson(res, 200, result);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/session/snapshot") {
+      const body = await readBody(req);
+      const result = await captureSnapshot(body.label);
+      sendJson(res, 200, result);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/api/session/snapshots") {
+      const list = [...snapshots.values()].map((s) => ({ snapshot_id: s.snapshot_id, captured_at: s.captured_at, label: s.label, place_id: s.place_id }));
+      sendJson(res, 200, { ok: true, snapshots: list });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/session/compare") {
+      const body = await readBody(req);
+      const a = body.a && typeof body.a === "object" ? body.a : snapshots.get(body.a);
+      const b = body.b && typeof body.b === "object" ? body.b : snapshots.get(body.b);
+      if (!a || !b) { sendJson(res, 404, { ok: false, error: "snapshot_not_found" }); return; }
+      sendJson(res, 200, compareSnapshots(a, b));
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/session/restore") {
+      const body = await readBody(req);
+      const snap = snapshots.get(body.snapshot_id);
+      if (!snap) { sendJson(res, 404, { ok: false, error: "snapshot_not_found" }); return; }
+      // Restore touches ONLY the tracked boundary recorded in the snapshot.
+      const payload = {};
+      if (snap.tracked.position) payload.position = snap.tracked.position;
+      const hum = {};
+      for (const [k, v] of Object.entries(snap.tracked)) {
+        if (k.startsWith("humanoid.")) hum[k.slice("humanoid.".length)] = v;
+      }
+      if (Object.keys(hum).length) payload.humanoid = hum;
+      const result = await sendOp("restore_state", payload, 15000);
+      sendJson(res, 200, { ...result, note: "restore is best-effort and non-transactional — verify with a fresh snapshot + compare" });
       return;
     }
     sendJson(res, 404, { ok: false, error: "not_found" });
